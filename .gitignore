@@ -1,0 +1,5 @@
+# local secrets — never commit
+emergent/secrets.local.json
+.env
+.env.*
+*.local.json
