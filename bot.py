@@ -10,7 +10,10 @@ import argparse
 import hashlib
 import sys
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor
+
+warnings.filterwarnings("ignore")
 
 import cv2
 
@@ -74,13 +77,8 @@ def adb_tap_device(mx: int, my: int) -> bool:
 def click_ui_button(name: str, fallback_x: int, fallback_y: int) -> bool:
     """
     Clicks a button. Reads from ui_coordinates.json, or uses fallback.
-    If on desktop, uses pyautogui.click. Otherwise, uses adb_tap_device directly with phone coordinates.
+    In ADB mode, maps desktop coordinates from ui_coordinates.json to ADB device coordinates.
     """
-    is_desktop = str(getattr(config, "DRAG_BACKEND", "auto")).lower() in ("mouse", "pyautogui", "desktop")
-    if not is_desktop:
-        # ADB mode: tap the phone directly using native phone coordinates (fallback_x, fallback_y)
-        return adb_tap_device(fallback_x, fallback_y)
-
     import json
     coords = None
     try:
@@ -89,6 +87,20 @@ def click_ui_button(name: str, fallback_x: int, fallback_y: int) -> bool:
         coords = data.get(name)
     except Exception:
         pass
+
+    is_desktop = str(getattr(config, "DRAG_BACKEND", "auto")).lower() in ("mouse", "pyautogui", "desktop")
+
+    if not is_desktop:
+        if coords:
+            try:
+                from adb_input import desktop_to_device
+                dev_xy = desktop_to_device(int(coords[0]), int(coords[1]))
+                if dev_xy:
+                    print_bot(f"Tapping phone at {dev_xy} (mapped from desktop {coords}) for '{name}'")
+                    return adb_tap_device(dev_xy[0], dev_xy[1])
+            except Exception as e:
+                print_bot(f"Mapping desktop coords to ADB failed for '{name}': {e}")
+        return adb_tap_device(fallback_x, fallback_y)
 
     if coords:
         x, y = int(coords[0]), int(coords[1])
@@ -279,6 +291,30 @@ def check_for_ad_and_restart() -> bool:
     return False
 
 
+def force_restart_app() -> bool:
+    """Forces ADB kill of the game app, launches it fresh, and waits for it to load."""
+    if str(getattr(config, "DRAG_BACKEND", "auto")).lower() in ("mouse", "pyautogui", "desktop"):
+        return False
+    from adb_input import get_device, _run
+    import time
+    dev = get_device()
+    if not dev:
+        return False
+    print_bot("\033[91m[Recovery] Force-restarting game app (com.peoplefun.wordsearch)...\033[0m")
+    try:
+        _run(["adb", "-s", dev.serial, "shell", "am", "force-stop", "com.peoplefun.wordsearch"])
+        time.sleep(1.0)
+        _run(["adb", "-s", dev.serial, "shell", "monkey", "-p", "com.peoplefun.wordsearch", "-c", "android.intent.category.LAUNCHER", "1"])
+        print_bot("Waiting 10 seconds for app to reload...")
+        time.sleep(10.0)
+        click_ui_button("next level", 617, 1983)
+        time.sleep(3.0)
+        return True
+    except Exception as e:
+        print_bot(f"Force restart failed: {e}")
+        return False
+
+
 def run_live(*, skip_calibrate_prompt: bool = False, force_calibrate: bool = False) -> int:
     try:
         import colorama
@@ -291,6 +327,7 @@ def run_live(*, skip_calibrate_prompt: bool = False, force_calibrate: bool = Fal
     from drag import drag_finds
     from solver import find_all, find_word
     import gpt_ocr
+    import mistral_ocr
 
     print("\n\033[96m" + "=" * 60)
     print("   Word Search Bot — Fully Automated GPT-5.6 JSON")
@@ -309,11 +346,10 @@ def run_live(*, skip_calibrate_prompt: bool = False, force_calibrate: bool = Fal
     # 2. Camera setup
     print_sys("Starting dxcam screen capture...")
     cam = create_camera()
-    # Initialize stopwatch
+    # Initialize stopwatch and chapter variables
     script_start = time.time()
     level_count = 0
-    # Cache only a few recent exact board captures. This saves a duplicate Terra
-    # grid call when theme extraction or popup handling retries the same level.
+    current_chapter_level: int | None = None
     grid_ocr_cache: dict[str, tuple[list[list[str]], float, list[str]]] = {}
 
     # 3. Main Loop
@@ -375,37 +411,14 @@ def run_live(*, skip_calibrate_prompt: bool = False, force_calibrate: bool = Fal
                 key = board_fingerprint(trimmed_board)
                 cached_grid = grid_ocr_cache.get(key)
 
-                print_gpt("OCR-ing grid card with Terra (Native High Res)...")
-                print_gpt("Parsing tightly cropped theme and word list with Terra...")
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    theme_job = pool.submit(
-                        gpt_ocr.read_theme_and_words_from_image, theme_img
-                    )
-                    grid_job = None
-                    if cached_grid is None:
-                        grid_job = pool.submit(
-                            gpt_ocr.read_grid_from_image, trimmed_board
-                        )
+                print_gpt("Running single-pass Mistral Vision OCR (grid + theme + words)...")
+                grid, words, theme, all_notes = mistral_ocr.read_all_from_image(img_full)
 
-                    theme, words, theme_notes = theme_job.result()
-                    if cached_grid is not None:
-                        grid, conf, grid_notes = cached_grid
-                        grid_notes = list(grid_notes) + ["reused identical Terra grid result"]
-                    else:
-                        assert grid_job is not None
-                        grid, conf, grid_notes = grid_job.result()
-                        if grid and key:
-                            grid_ocr_cache[key] = (grid, conf, list(grid_notes))
-                            if len(grid_ocr_cache) > 8:
-                                grid_ocr_cache.pop(next(iter(grid_ocr_cache)))
-
-                # If successful, break out of retry loop
                 if grid and words:
                     break
                 else:
                     print(f"\033[91m[Error]\033[0m Grid or word extraction failed on attempt {attempt}.")
-                    print(f"Grid Notes: {grid_notes}")
-                    print(f"Theme Notes: {theme_notes}")
+                    print(f"OCR Notes: {all_notes}")
                 play_fail_sound(attempt)
                 
                 # Check for active ads
@@ -453,17 +466,8 @@ def run_live(*, skip_calibrate_prompt: bool = False, force_calibrate: bool = Fal
                         time.sleep(6.0)
                 else:
                     # Force restart the game if extraction continually fails
-                    print_bot(f"Grid extraction failed {attempt+1} times. Force restarting game...")
-                    from adb_input import get_device, _run
-                    dev = get_device()
-                    if dev:
-                        _run(["adb", "-s", dev.serial, "shell", "am", "force-stop", "com.peoplefun.wordsearch"])
-                        time.sleep(1.0)
-                        _run(["adb", "-s", dev.serial, "shell", "monkey", "-p", "com.peoplefun.wordsearch", "-c", "android.intent.category.LAUNCHER", "1"])
-                        print_bot("Waiting 10 seconds for app to reload...")
-                        time.sleep(10.0)
-                        click_ui_button("next level", 617, 1983)
-                        time.sleep(4.0)
+                    print_bot(f"Grid extraction failed {attempt} times. Force restarting game...")
+                    force_restart_app()
 
             if not grid or not words:
                 continue
@@ -562,36 +566,79 @@ def run_live(*, skip_calibrate_prompt: bool = False, force_calibrate: bool = Fal
                 countdown=0
             )
             
-            print_bot("Sweeps complete! Polling locally for completion...")
-            board_gone = wait_for_board_state(cam, present=False, timeout_s=5.0)
-            if board_gone:
-                print_bot("Completion screen detected.")
-            else:
-                print_bot("Completion transition not detected; trying Next Level now.")
-
             level_duration = time.time() - level_start_time
-            import gpt_ocr
-            print_sys(f"=== Level solved in {level_duration:.1f} seconds! ({gpt_ocr.MODEL_NAME}) ===")
+            # Prompt user after 1st round to establish chapter level
+            if current_chapter_level is None:
+                print("\n" + "\033[93m=" * 64)
+                print_bot("\033[96m[Chapter Progress Setup]\033[0m")
+                inp = input("\033[93mWhat level in the chapter was just completed? (e.g. '3' or '3/12') [Default: 1]: \033[0m").strip()
+                if "/" in inp:
+                    try:
+                        current_chapter_level = int(inp.split("/")[0])
+                    except ValueError:
+                        current_chapter_level = 1
+                elif inp.isdigit():
+                    current_chapter_level = int(inp)
+                else:
+                    current_chapter_level = 1
+                print_sys(f"Chapter Progress tracker initialized to: {current_chapter_level}/12")
 
-            print_bot("Waiting 6s to display the completion screen...")
+            # --- POST-SOLVE VERIFICATION & MISTRAL VISION TRANSITION ---
+            print_bot(f"Current Chapter Progress: {current_chapter_level}/12. Waiting 6 seconds after level completion...")
             time.sleep(6.0)
-            
-            transition_baseline = grab_region(cam, "board")
-            print_bot("Tapping next level button...")
-            click_ui_button("next level", 799, 2244)
-            new_board = wait_for_new_board(
-                cam, transition_baseline, timeout_s=4.0
-            )
 
-            # Retry only when the first tap did not produce a different board. This
-            # replaces the old unconditional second tap and fixed transition sleeps.
-            if not new_board:
-                print_bot("New board not detected; retrying Next Level once...")
-                transition_baseline = grab_region(cam, "board")
-                click_ui_button("next level", 799, 2244)
-                wait_for_new_board(cam, transition_baseline, timeout_s=3.0)
+            for check_attempt in range(1, 4):
+                print_sys(f"Querying Mistral Vision to inspect post-level screen (Check #{check_attempt})...")
+                game_img = grab_region(cam, "game") if game_region else grab_region(cam, "board")
+                analysis = mistral_ocr.analyze_screen_state_with_mistral(game_img)
+                
+                screen_type = str(analysis.get("screen_type") or "").lower()
+                is_chapter_end = bool(analysis.get("is_chapter_end"))
+                cp = str(analysis.get("chapter_progress") or "")
 
-            check_for_ad_and_restart()
+                print_bot(f"Mistral Vision Report: screen='{screen_type}', chapter_progress='{cp}', chapter_end={is_chapter_end}")
+
+                if screen_type == "level_complete":
+                    if current_chapter_level >= 12 or is_chapter_end or "12/12" in cp or "12 / 12" in cp:
+                        print("\n" + "\033[93m=" * 64)
+                        print_bot("\033[93m[CHAPTER END DETECTED (12/12)]\033[0m")
+                        print("   Script is paused on Chapter Completion screen so you can map coordinates.")
+                        print("   Take your screenshot / map your button coordinates now.")
+                        print("=" * 64 + "\033[0m")
+                        input("\033[93m[Press ENTER when ready to continue]: \033[0m")
+                        current_chapter_level = 1
+                        break
+                    else:
+                        print_bot(f"Level {current_chapter_level}/12 complete. Tapping Next Level button...")
+                        click_ui_button("next level", 724, 2240)
+                        current_chapter_level += 1
+                        print_sys(f"Advanced Chapter Progress counter -> {current_chapter_level}/12")
+                        time.sleep(2.0)
+                        break
+
+                elif screen_type == "puzzle_board":
+                    print_bot("\033[91m[Swipes Failed]\033[0m Puzzle board is still visible! Re-executing swipes SLOWER...")
+                    from drag import path_to_screen
+                    from adb_input import get_device, find_scrcpy_window, desktop_to_device, adb_swipe_batch
+                    dev = get_device()
+                    win = find_scrcpy_window()
+                    swipes_to_run = []
+                    for f in finds:
+                        pts = path_to_screen(f.path, board_region=board_region, row_edges=None, col_edges=None, rows=rows, cols=cols)
+                        d0 = desktop_to_device(*pts[0], device=dev, window=win)
+                        d1 = desktop_to_device(*pts[-1], device=dev, window=win)
+                        if d0 and d1:
+                            dur = int(220 + len(pts) * 15)
+                            swipes_to_run.append((d0[0], d0[1], d1[0], d1[1], dur))
+                    if swipes_to_run:
+                        adb_swipe_batch(swipes_to_run, delay_s=0.15, device=dev)
+                    time.sleep(3.0)
+
+                else:
+                    print_bot("Ad or outside app screen detected. Triggering recovery...")
+                    check_for_ad_and_restart()
+                    time.sleep(3.0)
+                    break
             
         except KeyboardInterrupt:
             print("\n")
@@ -600,8 +647,9 @@ def run_live(*, skip_calibrate_prompt: bool = False, force_calibrate: bool = Fal
         except Exception as e:
             import traceback
             traceback.print_exc()
-            print_err(f"Unexpected error: {e}")
-            time.sleep(5.0)
+            print_err(f"Unexpected error: {e}. Force-restarting game app...")
+            force_restart_app()
+            time.sleep(2.0)
             
     return 0
 
@@ -609,7 +657,7 @@ def run_live(*, skip_calibrate_prompt: bool = False, force_calibrate: bool = Fal
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Word Search automator")
     p.add_argument("--force", action="store_true", help="Force interactive calibration on start")
-    p.add_argument("--model", type=str, default="terra", choices=["terra", "sol"], help="Theme/word model (the grid always uses Terra)")
+    p.add_argument("--model", type=str, default="sol", choices=["terra", "sol"], help="Theme/word model (defaults to Sol)")
     args = p.parse_args(argv)
 
     import gpt_ocr

@@ -16,13 +16,7 @@ from typing import Sequence
 
 import config
 
-try:
-    import pyautogui
 
-    pyautogui.FAILSAFE = True  # move mouse to top-left corner to abort
-    pyautogui.PAUSE = 0
-except ImportError as e:  # pragma: no cover
-    raise SystemExit("pyautogui required: pip install pyautogui") from e
 
 from solver import Find
 
@@ -175,6 +169,13 @@ def drag_path_mouse(points: list[tuple[int, int]]) -> None:
     """
     Desktop mouse drag (fallback). Often fails with DPI / overlay on top of scrcpy.
     """
+    try:
+        import pyautogui
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0
+    except ImportError as e:
+        raise SystemExit("pyautogui required for mouse backend: pip install pyautogui") from e
+
     move_lo = _cfg_float("DRAG_MOVE_MIN", 0.03)
     move_hi = _cfg_float("DRAG_MOVE_MAX", 0.08)
     start_lo = _cfg_float("DRAG_START_MIN", 0.02)
@@ -337,20 +338,13 @@ def drag_finds(
             if d0 and d1:
                 x1, y1 = d0
                 x2, y2 = d1
-                if len(pts) > 1:
-                    d_prev = desktop_to_device(*pts[-2], device=dev, window=win)
-                    if d_prev:
-                        vx = x2 - d_prev[0]
-                        vy = y2 - d_prev[1]
-                        x2 = int(x2 + vx * 0.25)
-                        y2 = int(y2 + vy * 0.25)
-                dur = int(180 + len(pts) * 15)
+                dur = int(140 + len(pts) * 10)
                 swipes_to_run.append((x1, y1, x2, y2, dur))
-                print(f"  queue drag {f.word}  device {d0} -> {(x2, y2)}  ({dur}ms)")
+                print(f"  queue drag {f.word}  device {d0} -> {d1}  ({dur}ms)")
                 
         if swipes_to_run:
-            print(f"Executing batch of {len(swipes_to_run)} swipes in a single ADB call (0.15s pause)...")
-            if adb_swipe_batch(swipes_to_run, delay_s=0.15, device=dev):
+            print(f"Executing batch of {len(swipes_to_run)} swipes via ADB...")
+            if adb_swipe_batch(swipes_to_run, delay_s=0.08, device=dev):
                 n = len(swipes_to_run)
     else:
         # Fallback mouse mode
@@ -380,10 +374,10 @@ def drag_finds(
             try:
                 if drag_path(pts, backend=backend):
                     n += 1
-            except pyautogui.FailSafeException:
-                print("  ABORTED (failsafe — mouse in corner)")
-                break
             except Exception as e:
+                if type(e).__name__ == "FailSafeException":
+                    print("  ABORTED (failsafe — mouse in corner)")
+                    break
                 print(f"  drag failed for {f.word}: {e}")
 
     print(f"Dragged {n}/{len(ordered)} words via {backend}.")

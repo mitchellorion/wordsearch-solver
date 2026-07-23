@@ -22,10 +22,25 @@ ROOT = Path(__file__).resolve().parent
 # ---------------------------------------------------------------------------
 REGIONS = {
     # Kalshi-style phone game: word card ABOVE the letter grid
-    "board": (1671, 572, 2157, 1138),
-    "word_list": (1666, 426, 2163, 543),
-    "game": (1646, 406, 2183, 1158),
+    "board": (1808, 785, 2482, 1542),
+    "word_list": (1800, 485, 2490, 745),
+    "game": (1780, 465, 2510, 1562),
 }
+
+# Auto-load calibration.json if present
+_cal_file = ROOT / "calibration.json"
+if _cal_file.exists():
+    try:
+        import json
+        _data = json.loads(_cal_file.read_text(encoding="utf-8"))
+        for _k, _v in (_data.get("regions") or {}).items():
+            if isinstance(_v, (list, tuple)) and len(_v) == 4:
+                REGIONS[_k] = tuple(int(_x) for _x in _v)
+        _gs = _data.get("grid_size")
+        if _gs and len(_gs) == 2:
+            GRID_SIZE = (int(_gs[0]), int(_gs[1]))
+    except Exception:
+        pass
 
 # Optional hand-maintained word list (one word per line). Used when OCR list empty.
 WORDS_FILE = ROOT / "words.txt"

@@ -8,7 +8,7 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -72,18 +72,36 @@ def _http_json(
     key = _api_key()
     if not key:
         raise RuntimeError("MISTRAL_API_KEY not set")
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{BASE}{path}",
-        data=data,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        },
-        method=method,
-    )
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    post_bytes = None if payload is None else json.dumps(payload).encode("utf-8")
+    wait_sec = 2.0
+    attempt = 1
+    while True:
+        try:
+            req = urllib.request.Request(
+                f"{BASE}{path}",
+                data=post_bytes,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                },
+                method=method,
+            )
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as err:
+            if err.code == 429:
+                print(f"\033[93m[Mistral API 429 Rate Limit]\033[0m Rate-limited (Attempt #{attempt}). Waiting {wait_sec:.1f}s before retrying...")
+                time.sleep(wait_sec)
+                wait_sec = min(wait_sec * 2.0, 32.0)
+                attempt += 1
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err:
+            print(f"\033[93m[Mistral Network Connection Error]\033[0m {err} (Attempt #{attempt}). Waiting {wait_sec:.1f}s before retrying...")
+            time.sleep(wait_sec)
+            wait_sec = min(wait_sec * 2.0, 32.0)
+            attempt += 1
+            continue
 
 
 def bgr_to_data_url(img: np.ndarray, max_side: int = 1600, quality: int = 90) -> str:
@@ -258,45 +276,70 @@ def _grid_from_board_vlm(img_bgr: np.ndarray) -> tuple[list[list[str]], list[str
 
 
 def read_grid_from_image(img_bgr: np.ndarray) -> tuple[list[list[str]], float, list[str]]:
-    """OCR grid image (trimmed card) -> grid letter matrix."""
+    """OCR grid image (trimmed card) -> grid letter matrix using Mistral Vision."""
     notes: list[str] = []
     grid = []
     
-    # 1. Try local Qwen-72B VLM first (free, local, and extremely accurate)
-    grid, vnotes = _grid_from_board_vlm(img_bgr)
-    notes.extend(vnotes)
-    
-    # 2. Fall back to Mistral OCR API if Qwen failed or returned too few rows
+    # Primary: Mistral Large Vision API
+    try:
+        url = bgr_to_data_url(img_bgr, max_side=1600)
+        prompt = (
+            "This is a cropped screenshot of a word search game's letter grid.\n"
+            "Please transcribe all letters of the grid row-by-row.\n"
+            "Return ONLY valid JSON:\n"
+            "{\n"
+            "  \"grid\": [\n"
+            "    \"ROW1_LETTERS\",\n"
+            "    \"ROW2_LETTERS\"\n"
+            "  ]\n"
+            "}\n"
+            "CRITICAL: Every row MUST have the exact same number of uppercase letters."
+        )
+        payload = {
+            "model": "mistral-large-latest",
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": url},
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": 1000,
+        }
+        out = _http_json("POST", "/chat/completions", payload, timeout=30.0)
+        choice = out.get("choices", [{}])[0]
+        content = choice.get("message", {}).get("content", "")
+        data = json.loads(content.strip())
+        
+        rows_text = [r.strip().upper() for r in data.get("grid", []) if r.strip()]
+        if rows_text:
+            import re
+            from collections import Counter
+            lengths = Counter(len(r) for r in rows_text)
+            cols = lengths.most_common(1)[0][0]
+            for r in rows_text:
+                r_clean = re.sub(r"[^A-Z]", "", r)
+                if len(r_clean) > cols:
+                    r_clean = r_clean[:cols]
+                elif len(r_clean) < cols:
+                    r_clean = r_clean + "?" * (cols - len(r_clean))
+                grid.append(list(r_clean))
+            notes.append(f"Mistral Vision read {len(grid)}x{cols} grid")
+    except Exception as exc:
+        notes.append(f"Mistral Vision grid read failed: {exc}")
+
+    # Fallback to Document OCR if Vision failed
     if not grid or len(grid) < 6:
-        print("\033[93m[Qwen-VLM]\033[0m Qwen grid incomplete/failed. Falling back to Mistral Cloud OCR...")
         try:
             text = ocr_document(img_bgr)
             grid, pnotes = parse_letter_grid(text)
             notes.extend(pnotes)
         except Exception as e:
-            notes.append(f"Mistral OCR failed: {e}")
-
-    # 3. Fall back to EasyOCR (CPU-based) if both failed
-    if not grid or len(grid) < 6 or any(len(row) < 6 for row in grid):
-        notes.append("Incomplete grid. Falling back to local EasyOCR...")
-        try:
-            import ocr
-            import solve_pipeline
-            reader = ocr.BoardOCR()
-            det = solve_pipeline._detect_once(img_bgr)
-            if det and det.rows >= 6 and det.cols >= 6:
-                egrid, confs = reader.read_grid(
-                    img_bgr,
-                    det.rows,
-                    det.cols,
-                    row_edges=list(det.row_edges),
-                    col_edges=list(det.col_edges)
-                )
-                if egrid and len(egrid) >= 6:
-                    grid = egrid
-                    notes.append(f"EasyOCR fallback successfully read {len(grid)}x{len(grid[0])} grid")
-        except Exception as e:
-            notes.append(f"EasyOCR fallback failed: {e}")
+            notes.append(f"Mistral Document OCR failed: {e}")
 
     if not grid:
         return [], 0.0, notes
@@ -377,59 +420,14 @@ def read_theme_and_words_from_image(img_bgr: np.ndarray) -> tuple[str, list[str]
     """Use chat completions to extract theme and words from full screenshot."""
     notes: list[str] = []
     
-    # Try local VLM (Qwen-72B) first
-    try:
-        from llm_assist import probe_llm, chat_completions, extract_json_object, bgr_to_data_url as local_bgr_to_data_url
-        ep, probe_notes = probe_llm()
-        if ep is not None:
-            notes.append(f"Using local VLM: {ep.vision_model}")
-            
-            # Crop to upper 50% of the active game area to minimize visual tokens
-            img_to_send = img_bgr
-            game_region = getattr(config, "REGIONS", {}).get("game")
-            if game_region and game_region[2] > game_region[0]:
-                l, t, r, b = [int(x) for x in game_region]
-                gh, gw = img_bgr.shape[:2]
-                l = max(0, min(l, gw))
-                r = max(0, min(r, gw))
-                t = max(0, min(t, gh))
-                b = max(0, min(b, gh))
-                if r > l and b > t:
-                    # Theme and word list are always in the top half
-                    mid_y = t + int((b - t) * 0.5)
-                    img_to_send = img_bgr[t:mid_y, l:r]
-                    notes.append(f"Cropped to upper game area: {img_to_send.shape}")
-            
-            # Downsample to 768 max_side to save bandwidth and compute
-            data_url = local_bgr_to_data_url(img_to_send, max_side=768)
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": THEME_PROMPT},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                }
-            ]
-            response = chat_completions(ep, messages, model=ep.vision_model, temperature=0, max_tokens=1000)
-            data = extract_json_object(response)
-            if data and "theme" in data:
-                theme = data.get("theme", "")
-                words = data.get("words", [])
-                notes.append(f"Local VLM extracted theme: {theme}")
-                return theme, words, notes
-            else:
-                notes.append(f"Local VLM response parsed as None. Raw response: {response[:300]}")
-    except Exception as e:
-        notes.append(f"Local VLM theme extraction failed: {e}")
-
-    # Fallback to Mistral API
+    # Primary: Mistral Large Vision API
     data_url = bgr_to_data_url(img_bgr)
-    model = "mistral-medium-latest"
-    notes.append(f"Falling back to Mistral API model={model}")
+    model = "mistral-large-latest"
+    notes.append(f"Querying Mistral Vision API model={model}")
 
     payload = {
         "model": model,
+        "response_format": {"type": "json_object"},
         "messages": [
             {
                 "role": "user",
@@ -468,6 +466,77 @@ def read_theme_and_words_from_image(img_bgr: np.ndarray) -> tuple[str, list[str]
     theme = data.get("theme", "")
     words = data.get("words", [])
     return theme, words, notes
+
+
+def read_all_from_image(img_bgr: np.ndarray) -> tuple[list[list[str]], list[str], str, list[str]]:
+    """
+    Single-pass extraction: reads grid, words, and theme in ONE single Mistral Vision call.
+    Avoids concurrent requests and eliminates 429 rate limit stalls!
+    Returns (grid, words, theme, notes).
+    """
+    notes: list[str] = []
+    grid, words, theme = [], [], ""
+    try:
+        url = bgr_to_data_url(img_bgr, max_side=1600)
+        prompt = (
+            "This is a screenshot of a word search mobile game.\n"
+            "Extract the level theme, displayed word bank, and the letter grid.\n"
+            "Return ONLY valid JSON:\n"
+            "{\n"
+            "  \"theme\": \"THEME_NAME\",\n"
+            "  \"words\": [\"WORD1\", \"WORD2\"],\n"
+            "  \"grid\": [\n"
+            "    \"ROW1_LETTERS\",\n"
+            "    \"ROW2_LETTERS\"\n"
+            "  ]\n"
+            "}\n"
+            "CRITICAL RULES:\n"
+            "1. 'theme': Upper-case string of the puzzle category/theme.\n"
+            "2. 'words': List of all target words shown in the word bank.\n"
+            "3. 'grid': List of row strings transcribing the letter grid. Every row MUST have the exact same number of uppercase letters."
+        )
+        payload = {
+            "model": "mistral-large-latest",
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": url},
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": 1200,
+        }
+        notes.append("Single-pass Mistral Vision call (grid + theme + words)...")
+        out = _http_json("POST", "/chat/completions", payload, timeout=40.0)
+        choice = out.get("choices", [{}])[0]
+        content = choice.get("message", {}).get("content", "")
+        data = json.loads(content.strip())
+        
+        theme = str(data.get("theme") or "").strip()
+        words = [w.strip().upper() for w in data.get("words", []) if w.strip()]
+        
+        rows_text = [r.strip().upper() for r in data.get("grid", []) if r.strip()]
+        if rows_text:
+            import re
+            from collections import Counter
+            lengths = Counter(len(r) for r in rows_text)
+            cols = lengths.most_common(1)[0][0]
+            for r in rows_text:
+                r_clean = re.sub(r"[^A-Z]", "", r)
+                if len(r_clean) > cols:
+                    r_clean = r_clean[:cols]
+                elif len(r_clean) < cols:
+                    r_clean = r_clean + "?" * (cols - len(r_clean))
+                grid.append(list(r_clean))
+            notes.append(f"Single-pass extracted {len(grid)}x{cols} grid, theme='{theme}', {len(words)} words")
+    except Exception as exc:
+        notes.append(f"Single-pass Mistral Vision call failed: {exc}")
+
+    return grid, words, theme, notes
 
 
 POPUP_PROMPT = """\
@@ -529,3 +598,61 @@ def find_popup_close_button(img_bgr: np.ndarray) -> tuple[int, int] | None:
     except Exception:
         pass
     return None
+
+
+def analyze_screen_state_with_mistral(img_bgr: np.ndarray) -> dict[str, Any]:
+    """
+    Queries Mistral Vision to inspect the current game screen state.
+    Returns dict:
+      {
+        "screen_type": "level_complete" | "puzzle_board" | "ad_or_other",
+        "chapter_progress": "7/12" | "11/12" | "12/12",
+        "is_chapter_end": bool
+      }
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        return {"screen_type": "unknown", "chapter_progress": "", "is_chapter_end": False}
+    try:
+        url = bgr_to_data_url(img_bgr, max_side=1200)
+        prompt = (
+            "Analyze this Word Search mobile game screenshot.\n"
+            "Determine if the screen shows:\n"
+            "1. 'level_complete' (shows LEVEL COMPLETE!, reward coins, or chapter progress like 7/12, 11/12, 12/12)\n"
+            "2. 'puzzle_board' (shows an active letter grid with unselected or partially selected letters)\n"
+            "3. 'ad_or_other' (shows an ad, Play Store, or outside app)\n\n"
+            "Extract chapter progress string if visible (e.g. '7/12', '11/12', '12/12').\n"
+            "Set 'is_chapter_end' to true if chapter progress is 11/12, 12/12, or indicates chapter end.\n\n"
+            "Return ONLY valid JSON:\n"
+            "{\n"
+            "  \"screen_type\": \"level_complete\",\n"
+            "  \"chapter_progress\": \"7/12\",\n"
+            "  \"is_chapter_end\": false\n"
+            "}"
+        )
+        payload = {
+            "model": "mistral-large-latest",
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": url},
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": 200,
+        }
+        out = _http_json("POST", "/chat/completions", payload, timeout=30.0)
+        choice = out.get("choices", [{}])[0]
+        content = choice.get("message", {}).get("content", "")
+        data = json.loads(content.strip())
+        
+        cp = str(data.get("chapter_progress") or "").strip()
+        if "12/12" in cp or "12 / 12" in cp:
+            data["is_chapter_end"] = True
+            
+        return data
+    except Exception as exc:
+        return {"screen_type": "error", "error": str(exc), "chapter_progress": "", "is_chapter_end": False}

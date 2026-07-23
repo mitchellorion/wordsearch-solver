@@ -1,5 +1,23 @@
-# local secrets — never commit
-emergent/secrets.local.json
+# secrets
 .env
 .env.*
 *.local.json
+
+# python bytecode & caches
+__pycache__/
+*.pyc
+
+# temporary runtime debug images & logs
+*.png
+bot_output.txt
+sessions/
+scratch/
+samples/
+node_modules/
+package-lock.json
+package.json
+evaluatemegrok.*
+irrelevant_files/
+apk_extract/
+dictionary.txt
+words.txt

@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 
 import cv2
 import httpx
 import numpy as np
 from dotenv import load_dotenv
-from openai import OpenAI
+
+import config
 
 load_dotenv()
-client = OpenAI(timeout=30.0, http_client=httpx.Client(verify=False, timeout=30.0))
-GRID_MODEL_NAME = "gpt-5.6-terra"
-# Theme/word extraction may be switched by bot.py; grid OCR never is.
+
+GRID_MODEL_NAME = "gpt-5.6-sol"
 MODEL_NAME = GRID_MODEL_NAME
 
 
@@ -47,15 +48,18 @@ def extract_json_object(text: str) -> dict | None:
 
 
 def _validated_grid(raw_grid: object) -> tuple[list[list[str]], str | None]:
-    """Validate Terra output. Invalid output must be retried with Terra."""
+    """Validate Terra/Sol output."""
     if not isinstance(raw_grid, list):
         return [], "grid is not a list"
 
     grid: list[list[str]] = []
     for raw_row in raw_grid:
-        if not isinstance(raw_row, list):
-            return [], "a row is not a list"
-        grid.append([str(ch).strip().upper() for ch in raw_row])
+        if isinstance(raw_row, str):
+            grid.append([ch.upper() for ch in raw_row.strip() if ch.isalpha()])
+        elif isinstance(raw_row, list):
+            grid.append([str(ch).strip().upper() for ch in raw_row if str(ch).strip()])
+        else:
+            return [], "a row is neither a list nor a string"
 
     rows = len(grid)
     widths = {len(row) for row in grid}
@@ -73,10 +77,45 @@ def _validated_grid(raw_grid: object) -> tuple[list[list[str]], str | None]:
     return grid, None
 
 
-def read_grid_from_image(img_bgr: np.ndarray) -> tuple[list[list[str]], float, list[str]]:
-    """Read the grid with Terra at high detail. There is intentionally no OCR fallback."""
+def _call_terra(messages: list, model: str, timeout: float = 35.0) -> dict | None:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        print("\033[91m[Error] OPENAI_API_KEY is missing from .env\033[0m")
+        return None
+
+    base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
+    endpoint = f"{base_url.rstrip('/')}/chat/completions"
+
+    payload = {
+        "model": model,
+        "response_format": {"type": "json_object"},
+        "messages": messages,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        r = httpx.post(endpoint, headers=headers, json=payload, verify=False, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return extract_json_object(content) or (json.loads(content) if content else None)
+        else:
+            print(f"\033[91m[{model} API Error]\033[0m Status {r.status_code}: {r.text[:200]}")
+    except Exception as exc:
+        print(f"\033[91m[{model} Request Failed]\033[0m {exc}")
+    return None
+
+
+def read_grid_from_image(
+    img_bgr: np.ndarray,
+    model_override: str | None = None
+) -> tuple[list[list[str]], float, list[str]]:
+    """Read the grid with Terra/Sol at high detail."""
     notes: list[str] = []
-    model_name = GRID_MODEL_NAME
+    model_name = model_override or GRID_MODEL_NAME
     print(f"\033[93m[{model_name}]\033[0m Analyzing grid card (High Res)...")
     data_url = bgr_to_data_url(img_bgr)
     prompt = """Extract the letter grid exactly as it appears.
@@ -84,41 +123,39 @@ Return ONLY valid JSON in this format:
 {"grid": [["A","B"],["C","D"]]}
 Make sure to include every single letter. The grid is typically dense."""
 
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            response_format={"type": "json_object"},
-            messages=[
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert, flawless computer vision engine. Your only "
+                "job is to scan images, extract dense grids of letters perfectly "
+                "without skipping any rows or columns, and output raw JSON without "
+                "any markdown formatting."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
                 {
-                    "role": "system",
-                    "content": (
-                        "You are an expert, flawless computer vision engine. Your only "
-                        "job is to scan images, extract dense grids of letters perfectly "
-                        "without skipping any rows or columns, and output raw JSON without "
-                        "any markdown formatting."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": data_url, "detail": "high"},
-                        },
-                    ],
+                    "type": "image_url",
+                    "image_url": {"url": data_url, "detail": "high"},
                 },
             ],
-        )
-        content = response.choices[0].message.content or ""
-        data = json.loads(content)
-        grid, problem = _validated_grid(data.get("grid"))
-        if grid:
-            notes.append(
-                f"{model_name} successfully read {len(grid)}x{len(grid[0])} grid"
-            )
-            return grid, 0.92, notes
-        notes.append(f"{model_name} returned invalid grid: {problem}")
+        },
+    ]
+
+    try:
+        data = _call_terra(messages, model_name)
+        if data:
+            raw_grid = data.get("grid") or data.get("rows") or data.get("matrix") or data.get("letter_grid")
+            grid, problem = _validated_grid(raw_grid)
+            if grid:
+                notes.append(
+                    f"{model_name} successfully read {len(grid)}x{len(grid[0])} grid"
+                )
+                return grid, 0.92, notes
+            notes.append(f"{model_name} returned invalid grid: {problem}")
     except Exception as exc:
         notes.append(f"{model_name} failed: {exc}")
 
@@ -127,13 +164,13 @@ Make sure to include every single letter. The grid is typically dense."""
 
 def read_theme_and_words_from_image(
     img_bgr: np.ndarray,
+    model_override: str | None = None
 ) -> tuple[str, list[str], list[str]]:
-    """Read a tightly cropped theme/word-list panel with Terra."""
+    """Read a tightly cropped theme/word-list panel with Terra/Sol."""
     notes: list[str] = []
-    # The caller supplies a tight panel crop. 1024 preserves its text while avoiding
-    # the visual-token and upload cost of a full game/monitor screenshot.
+    model_name = model_override or MODEL_NAME
     data_url = bgr_to_data_url(img_bgr, max_side=1024, quality=88)
-    print(f"\033[93m[{MODEL_NAME}]\033[0m Analyzing theme and words (High Res)...")
+    print(f"\033[93m[{model_name}]\033[0m Analyzing theme and words (High Res)...")
     prompt = """Analyze this Word Search game's theme and word-list panel.
 Return ONLY valid JSON:
 {
@@ -142,39 +179,35 @@ Return ONLY valid JSON:
 }
 Include every displayed word. Ignore level numbers and other UI. Output JSON only."""
 
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            response_format={"type": "json_object"},
-            messages=[
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Extract the Word Search theme and displayed word list, returning "
+                "only perfectly formatted JSON."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
                 {
-                    "role": "system",
-                    "content": (
-                        "Extract the Word Search theme and displayed word list, returning "
-                        "only perfectly formatted JSON."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": data_url, "detail": "high"},
-                        },
-                    ],
+                    "type": "image_url",
+                    "image_url": {"url": data_url, "detail": "high"},
                 },
             ],
-        )
-        reply = response.choices[0].message.content or ""
-        data = extract_json_object(reply)
+        },
+    ]
+
+    try:
+        data = _call_terra(messages, model_name)
         if data:
             theme = str(data.get("theme") or "").strip()
             raw_words = data.get("words") or []
             words = [str(word).strip().upper() for word in raw_words if str(word).strip()]
-            notes.append(f"{MODEL_NAME} Theme OCR Success")
+            notes.append(f"{model_name} Theme OCR Success")
             return theme, words, notes
     except Exception as exc:
-        notes.append(f"{MODEL_NAME} call failed: {exc}")
+        notes.append(f"{model_name} call failed: {exc}")
 
     return "", [], notes

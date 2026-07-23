@@ -93,31 +93,20 @@ def create_camera(output_idx: int | None = None):
         bx = (int(board[0]) + int(board[2])) // 2
         by = (int(board[1]) + int(board[3])) // 2
         try:
-            import mss
-            with mss.mss() as sct:
-                for idx, monitor in enumerate(sct.monitors[1:]):
-                    left = monitor["left"]
-                    top = monitor["top"]
-                    right = left + monitor["width"]
-                    bottom = top + monitor["height"]
-                    if left <= bx <= right and top <= by <= bottom:
-                        preferred = idx
-                        DXCAM_MONITOR_LEFT = left
-                        DXCAM_MONITOR_TOP = top
-                        print(f"Auto-detected game window on Monitor {idx} (offset: {left},{top})")
-                        break
-        except Exception:
-            pass
+            import win32api
+            monitors = win32api.EnumDisplayMonitors()
+            for idx, m in enumerate(monitors):
+                left, top, right, bottom = m[2]
+                if left <= bx <= right and top <= by <= bottom:
+                    preferred = idx
+                    DXCAM_MONITOR_LEFT = left
+                    DXCAM_MONITOR_TOP = top
+                    print(f"Auto-detected game window on Monitor {idx} (offset: {left},{top})")
+                    break
+        except Exception as e:
+            print(f"win32api auto-detect failed: {e}")
     elif output_idx is not None:
-        try:
-            import mss
-            with mss.mss() as sct:
-                if output_idx + 1 < len(sct.monitors):
-                    mon = sct.monitors[output_idx + 1]
-                    DXCAM_MONITOR_LEFT = mon["left"]
-                    DXCAM_MONITOR_TOP = mon["top"]
-        except Exception:
-            pass
+        pass
 
     if dxcam is not None:
         # Try preferred index, then every output, with short retries
@@ -263,15 +252,7 @@ def grab(
             time.sleep(delay_s)
     if (frame is None or getattr(frame, "size", 0) == 0) and not hasattr(cam, "backend"):
         if enabled(1):
-            vprint("dxcam failed to grab region (possibly on another monitor). Falling back to mss...", lvl=1, tag="DXCAM")
-        try:
-            pref_idx = config.DXCAM_OUTPUT_IDX + 1
-            mss_cam = MssCamera(monitor_idx=pref_idx)
-            frame = mss_cam.grab(region=region)
-            mss_cam.release()
-        except Exception as e:
-            if enabled(1):
-                vprint(f"mss fallback failed: {e}", lvl=1, tag="DXCAM")
+            vprint("dxcam failed to grab region (possibly on another monitor). No fallback available.", lvl=1, tag="DXCAM")
 
     if frame is not None and getattr(frame, "size", 0) > 0:
         out = enhance_frame(frame) if enhance else frame
